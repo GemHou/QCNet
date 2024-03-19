@@ -138,22 +138,7 @@ class QCNetDecoder(nn.Module):
         self.to_pi = MLPLayer(input_dim=hidden_dim, hidden_dim=hidden_dim, output_dim=1)
         self.apply(weight_init)
 
-    def forward(self,
-                data: HeteroData,
-                scene_enc: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        pos_m = data['agent']['position'][:, self.num_historical_steps - 1, :self.input_dim]
-        head_m = data['agent']['heading'][:, self.num_historical_steps - 1]
-        head_vector_m = torch.stack([head_m.cos(), head_m.sin()], dim=-1)
-
-        x_t = scene_enc['x_a'].reshape(-1, self.hidden_dim)
-        x_pl = scene_enc['x_pl'][:, self.num_historical_steps - 1].repeat(self.num_modes, 1)
-        x_a = scene_enc['x_a'][:, -1].repeat(self.num_modes, 1)
-        m = self.mode_emb.weight.repeat(scene_enc['x_a'].size(0), 1)
-
-        mask_src = data['agent']['valid_mask'][:, :self.num_historical_steps].contiguous()
-        mask_src[:, :self.num_historical_steps - self.num_t2m_steps] = False
-        mask_dst = data['agent']['predict_mask'].any(dim=-1, keepdim=True).repeat(1, self.num_modes)
-
+    def generate_r_t2m(self, data, head_m, head_vector_m, mask_dst, mask_src, pos_m):
         pos_t = data['agent']['position'][:, :self.num_historical_steps, :self.input_dim].reshape(-1, self.input_dim)
         head_t = data['agent']['heading'][:, :self.num_historical_steps].reshape(-1)
         edge_index_t2m = bipartite_dense_to_sparse(mask_src.unsqueeze(2) & mask_dst[:, -1:].unsqueeze(1))
@@ -167,7 +152,9 @@ class QCNetDecoder(nn.Module):
         r_t2m = self.r_t2m_emb(continuous_inputs=r_t2m, categorical_embs=None)
         edge_index_t2m = bipartite_dense_to_sparse(mask_src.unsqueeze(2) & mask_dst.unsqueeze(1))
         r_t2m = r_t2m.repeat_interleave(repeats=self.num_modes, dim=0)
+        return edge_index_t2m, r_t2m
 
+    def generate_r_pl2m(self, data, head_m, head_vector_m, mask_dst, pos_m):
         pos_pl = data['map_polygon']['position'][:, :self.input_dim]
         orient_pl = data['map_polygon']['orientation']
         edge_index_pl2m = radius(
@@ -188,7 +175,9 @@ class QCNetDecoder(nn.Module):
         edge_index_pl2m = torch.cat([edge_index_pl2m + i * edge_index_pl2m.new_tensor(
             [[data['map_polygon']['num_nodes']], [data['agent']['num_nodes']]]) for i in range(self.num_modes)], dim=1)
         r_pl2m = r_pl2m.repeat(self.num_modes, 1)
+        return edge_index_pl2m, r_pl2m
 
+    def generate_r_a2m(self, data, head_m, head_vector_m, mask_dst, mask_src, pos_m):
         edge_index_a2m = radius_graph(
             x=pos_m[:, :2],
             r=self.a2m_radius,
@@ -207,6 +196,29 @@ class QCNetDecoder(nn.Module):
             [edge_index_a2m + i * edge_index_a2m.new_tensor([data['agent']['num_nodes']]) for i in
              range(self.num_modes)], dim=1)
         r_a2m = r_a2m.repeat(self.num_modes, 1)
+        return edge_index_a2m, r_a2m
+
+    def forward(self,
+                data: HeteroData,
+                scene_enc: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        pos_m = data['agent']['position'][:, self.num_historical_steps - 1, :self.input_dim]
+        head_m = data['agent']['heading'][:, self.num_historical_steps - 1]
+        head_vector_m = torch.stack([head_m.cos(), head_m.sin()], dim=-1)
+
+        x_t = scene_enc['x_a'].reshape(-1, self.hidden_dim)
+        x_pl = scene_enc['x_pl'][:, self.num_historical_steps - 1].repeat(self.num_modes, 1)
+        x_a = scene_enc['x_a'][:, -1].repeat(self.num_modes, 1)
+        m = self.mode_emb.weight.repeat(scene_enc['x_a'].size(0), 1)
+
+        mask_src = data['agent']['valid_mask'][:, :self.num_historical_steps].contiguous()
+        mask_src[:, :self.num_historical_steps - self.num_t2m_steps] = False
+        mask_dst = data['agent']['predict_mask'].any(dim=-1, keepdim=True).repeat(1, self.num_modes)
+
+        edge_index_t2m, r_t2m = self.generate_r_t2m(data, head_m, head_vector_m, mask_dst, mask_src, pos_m)
+
+        edge_index_pl2m, r_pl2m = self.generate_r_pl2m(data, head_m, head_vector_m, mask_dst, pos_m)
+
+        edge_index_a2m, r_a2m = self.generate_r_a2m(data, head_m, head_vector_m, mask_dst, mask_src, pos_m)
 
         edge_index_m2m = dense_to_sparse(mask_dst.unsqueeze(2) & mask_dst.unsqueeze(1))[0]
 
